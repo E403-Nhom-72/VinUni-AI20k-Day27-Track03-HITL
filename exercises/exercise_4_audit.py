@@ -18,9 +18,15 @@ Approach:
     - Implement the one-line body of `audit()`. Everything else (graph wiring,
       checkpointer setup, interrupt/resume loop) is already done for you.
 
-TODOs to complete (10 total): the audit() body, ONE AuditEntry per node for
+Implemented: the audit() body, ONE AuditEntry per node for
 analyze/route/commit/auto_approve/synthesize, TWO each for human_approval and
 escalate (before + after the interrupt).
+
+Note: the "before interrupt" AuditEntry for human_approval/escalate lives in a
+separate node (`node_human_approval_prepare` / `node_escalate_prepare`) that
+runs — and is checkpointed — before the interrupt-containing node. LangGraph
+re-executes a node from the top on resume, so a side effect placed before
+interrupt() in the *same* node would otherwise be logged twice.
 """
 
 from __future__ import annotations
@@ -61,9 +67,7 @@ async def audit(state, entry: AuditEntry) -> None:
     `thread_id` and `pr_url` are taken from `state` so callers only build
     the entry itself.
     """
-    # TODO: call write_audit_event(thread_id=state["thread_id"],
-    #                              pr_url=state["pr_url"], entry=entry)
-    raise NotImplementedError("Implement the audit() body — one call to write_audit_event")
+    await write_audit_event(thread_id=state["thread_id"], pr_url=state["pr_url"], entry=entry)
 
 
 # ─── Reference example — read this carefully ───────────────────────────────
@@ -97,17 +101,48 @@ async def node_fetch_pr(state):
 # ───────────────────────────────────────────────────────────────────────────
 
 
+ANALYZE_SYSTEM_PROMPT = (
+    "You are a senior software engineer performing an automated first-pass PR review. "
+    "Produce a structured review with a self-reported `confidence` (0.0-1.0) representing "
+    "how safe it would be to accept this PR's changes WITHOUT further human review.\n\n"
+    "Calibrate confidence using this rubric:\n"
+    "- HIGH confidence (> 0.8): mechanical changes only — typo fixes, formatting, dependency "
+    "bumps, small additive fields with no schema/security impact.\n"
+    "- MEDIUM confidence (0.5-0.75): otherwise-safe changes that still touch things a human "
+    "should sanity-check, e.g. schema/database migrations, new API endpoints, non-trivial "
+    "logic changes.\n"
+    "- LOW confidence (< 0.5): anything with real risk — weak/broken cryptography (e.g. "
+    "MD5/SHA1 password hashing), secrets or tokens stored/transmitted in plaintext, SQL built "
+    "via string concatenation/formatting (injection risk), hardcoded credentials or user/tenant "
+    "IDs, missing auth checks, or security-sensitive code shipped without tests.\n\n"
+    "List every concrete risk you find in `risk_factors`, and cite the specific file for each "
+    "review comment.\n\n"
+    "If your confidence is below 0.60, you MUST populate `escalation_questions` with 2-4 "
+    "specific, context-rich questions for a human reviewer — each one referencing the exact "
+    "file/section of the diff it's about. Do not ask generic questions like 'What is the intent "
+    "of this PR?'."
+)
+
+
 async def node_analyze(state):
     console.print("[cyan]→ analyze[/cyan]")
     t0 = time.monotonic()
     llm = get_llm().with_structured_output(PRAnalysis)
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
         a: PRAnalysis = await llm.ainvoke([
-            {"role": "system", "content": "Senior reviewer. Structured output."},
+            {"role": "system", "content": ANALYZE_SYSTEM_PROMPT},
             {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
         ])
     console.print(f"  [green]✓[/green] confidence={a.confidence:.0%}, {len(a.comments)} comment(s)")
-    # TODO: build and emit an AuditEntry for this step. Use the LLM's output `a`.
+    await audit(state, AuditEntry(
+        agent_id=AGENT_ID,
+        action="analyze",
+        confidence=a.confidence,
+        risk_level=risk_level_for(a.confidence),
+        decision="pending",
+        reason=a.confidence_reasoning,
+        execution_time_ms=int((time.monotonic() - t0) * 1000),
+    ))
     return {"analysis": a}
 
 
@@ -122,15 +157,41 @@ async def node_route(state):
     else:
         decision = "human_approval"
     console.print(f"  [green]✓[/green] decision=[bold]{decision}[/bold] (confidence={c:.0%})")
-    # TODO: emit an AuditEntry — this is the first row where `decision` is real.
+    await audit(state, AuditEntry(
+        agent_id=AGENT_ID,
+        action="route",
+        confidence=c,
+        risk_level=risk_level_for(c),
+        decision=decision,
+        reason=f"Routed to {decision}",
+        execution_time_ms=int((time.monotonic() - t0) * 1000),
+    ))
     return {"decision": decision}
+
+
+async def node_human_approval_prepare(state):
+    """Runs once, BEFORE the interrupt-containing node. Kept as a separate node
+    (instead of inline before interrupt()) because LangGraph re-executes a node
+    from the top on resume — a side effect placed before interrupt() in the same
+    node would otherwise be logged twice. This node completes and is checkpointed
+    before the graph reaches the interrupt, so it only runs once."""
+    t0 = time.monotonic()
+    a = state["analysis"]
+    await audit(state, AuditEntry(
+        agent_id=AGENT_ID,
+        action="human_approval",
+        confidence=a.confidence,
+        risk_level=risk_level_for(a.confidence),
+        decision="pending",
+        reason="Waiting for reviewer approve/reject/edit",
+        execution_time_ms=int((time.monotonic() - t0) * 1000),
+    ))
+    return {}
 
 
 async def node_human_approval(state):
     t0 = time.monotonic()
     a = state["analysis"]
-
-    # TODO #1 — audit BEFORE the interrupt. No human has responded yet.
 
     resp = interrupt({
         "kind": "approval_request",
@@ -142,9 +203,17 @@ async def node_human_approval(state):
         "diff_preview": state["pr_diff"][:2000],
     })
 
-    # TODO #2 — audit AFTER resume. Now you know the reviewer's choice
-    #           (approve / reject / edit), their feedback, and who they are
-    #           (os.environ.get("GITHUB_USER")).
+    t1 = time.monotonic()
+    await audit(state, AuditEntry(
+        agent_id=AGENT_ID,
+        action="human_approval",
+        confidence=a.confidence,
+        risk_level=risk_level_for(a.confidence),
+        reviewer_id=os.environ.get("GITHUB_USER"),
+        decision=resp.get("choice") or "pending",
+        reason=resp.get("feedback") or None,
+        execution_time_ms=int((time.monotonic() - t1) * 1000),
+    ))
     return {"human_choice": resp.get("choice"), "human_feedback": resp.get("feedback")}
 
 
@@ -183,7 +252,17 @@ async def node_commit(state):
     else:
         console.print(f"  [yellow]·[/yellow] skipping comment (choice={state.get('human_choice')})")
         action = "rejected"
-    # TODO: emit an AuditEntry summarising what was committed (or rejected).
+    a = state["analysis"]
+    await audit(state, AuditEntry(
+        agent_id=AGENT_ID,
+        action="commit",
+        confidence=a.confidence,
+        risk_level=risk_level_for(a.confidence),
+        reviewer_id=os.environ.get("GITHUB_USER") if state.get("human_choice") or state.get("escalation_answers") else None,
+        decision=action,
+        reason=state.get("human_feedback") or a.confidence_reasoning,
+        execution_time_ms=int((time.monotonic() - t0) * 1000),
+    ))
     return {"final_action": action}
 
 
@@ -192,16 +271,41 @@ async def node_auto_approve(state):
     t0 = time.monotonic()
     a = state["analysis"]
     action = _post(state)
-    # TODO: emit an AuditEntry — no human was involved, decision is "auto".
+    await audit(state, AuditEntry(
+        agent_id=AGENT_ID,
+        action="auto_approve",
+        confidence=a.confidence,
+        risk_level=risk_level_for(a.confidence),
+        reviewer_id=None,
+        decision="auto",
+        reason=a.confidence_reasoning,
+        execution_time_ms=int((time.monotonic() - t0) * 1000),
+    ))
     return {"final_action": f"auto_{action}"}
+
+
+async def node_escalate_prepare(state):
+    """Runs once, BEFORE the interrupt-containing node — see node_human_approval_prepare
+    docstring for why this must be a separate node rather than inline before interrupt()."""
+    t0 = time.monotonic()
+    a = state["analysis"]
+    questions = a.escalation_questions or ["What is the intent of this PR?"]
+    await audit(state, AuditEntry(
+        agent_id=AGENT_ID,
+        action="escalate",
+        confidence=a.confidence,
+        risk_level=risk_level_for(a.confidence),
+        decision="pending",
+        reason=f"Asked reviewer {len(questions)} question(s): {a.confidence_reasoning}",
+        execution_time_ms=int((time.monotonic() - t0) * 1000),
+    ))
+    return {}
 
 
 async def node_escalate(state):
     t0 = time.monotonic()
     a = state["analysis"]
     questions = a.escalation_questions or ["What is the intent of this PR?"]
-
-    # TODO #1 — audit BEFORE the interrupt (reviewer hasn't answered yet).
 
     answers = interrupt({
         "kind": "escalation",
@@ -213,7 +317,17 @@ async def node_escalate(state):
         "questions": questions,
     })
 
-    # TODO #2 — audit AFTER resume. You now have the answers.
+    t1 = time.monotonic()
+    await audit(state, AuditEntry(
+        agent_id=AGENT_ID,
+        action="escalate",
+        confidence=a.confidence,
+        risk_level=risk_level_for(a.confidence),
+        reviewer_id=os.environ.get("GITHUB_USER"),
+        decision="escalate",
+        reason="Reviewer answered escalation questions",
+        execution_time_ms=int((time.monotonic() - t1) * 1000),
+    ))
     return {"escalation_answers": answers}
 
 
@@ -228,8 +342,16 @@ async def node_synthesize(state):
             {"role": "user", "content": f"Diff:\n{state['pr_diff']}\n\nQ&A:\n{qa}"},
         ])
     console.print(f"  [green]✓[/green] refined confidence={refined.confidence:.0%}")
-    # TODO: emit an AuditEntry — use the NEW confidence (refined.confidence),
-    #       which should be higher than the original analysis.
+    await audit(state, AuditEntry(
+        agent_id=AGENT_ID,
+        action="synthesize",
+        confidence=refined.confidence,
+        risk_level=risk_level_for(refined.confidence),
+        reviewer_id=os.environ.get("GITHUB_USER"),
+        decision="pending",
+        reason=refined.confidence_reasoning,
+        execution_time_ms=int((time.monotonic() - t0) * 1000),
+    ))
     # node_commit will run next and post the refined review to the PR.
     return {"analysis": refined}
 
@@ -238,8 +360,11 @@ def build_graph(checkpointer):
     g = StateGraph(ReviewState)
     for name, fn in [
         ("fetch_pr", node_fetch_pr), ("analyze", node_analyze), ("route", node_route),
-        ("auto_approve", node_auto_approve), ("human_approval", node_human_approval),
-        ("commit", node_commit), ("escalate", node_escalate), ("synthesize", node_synthesize),
+        ("auto_approve", node_auto_approve),
+        ("human_approval_prepare", node_human_approval_prepare), ("human_approval", node_human_approval),
+        ("commit", node_commit),
+        ("escalate_prepare", node_escalate_prepare), ("escalate", node_escalate),
+        ("synthesize", node_synthesize),
     ]:
         g.add_node(name, fn)
     g.add_edge(START, "fetch_pr")
@@ -247,11 +372,13 @@ def build_graph(checkpointer):
     g.add_edge("analyze", "route")
     g.add_conditional_edges(
         "route", lambda s: s["decision"],
-        {"auto_approve": "auto_approve", "human_approval": "human_approval", "escalate": "escalate"},
+        {"auto_approve": "auto_approve", "human_approval": "human_approval_prepare", "escalate": "escalate_prepare"},
     )
     g.add_edge("auto_approve", END)
+    g.add_edge("human_approval_prepare", "human_approval")
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
+    g.add_edge("escalate_prepare", "escalate")
     g.add_edge("escalate", "synthesize")
     g.add_edge("synthesize", "commit")
     return g.compile(checkpointer=checkpointer)
